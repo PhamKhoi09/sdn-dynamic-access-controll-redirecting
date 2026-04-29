@@ -1,2 +1,2 @@
-# QoS redirect traffic based on Role
+# SDN Redirect traffic based on Role
 
