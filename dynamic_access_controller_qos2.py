@@ -1,4 +1,5 @@
-# dynamic_access_controller.py
+﻿# dynamic_access_controller_qos2.py
+
 from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
@@ -6,406 +7,355 @@ from ryu.lib import hub
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib.packet import packet, ethernet, ipv4, arp
 
+import json
 import logging
+import os
 import time
 
-from policy_engine import PolicyEngine, WINDOW_SECONDS
 from reroute_engine import (
-    RerouteEngine,
-    STATS_INTERVAL, REROUTE_PRIORITY, ROLES_TO_REROUTE,
-    TOPO_HOST_SWITCH, TOPO_SERVER_SWITCH,
-    PRIMARY_EGRESS_PORT, ALTERNATE_EGRESS_PORT, CONGESTION_MONITOR,
-    CONGESTION_DETECTED, CONGESTION_ACTIVE, CONGESTION_CLEARED,
+    RedirectEngine,
+    TOPO_HUB_SWITCH, CLIENT_FACING_PORT,
+    ROLE_SERVER_MAP, GUEST_SERVER_IP, SERVER_EGRESS_PORT,
+    DEFAULT_ROLE, REDIRECT_PRIORITY, SESSION_POLL_INTERVAL,
 )
+
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 class DynamicAccessController(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
     def __init__(self, *args, **kwargs):
-        super(DynamicAccessController, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
+        self.logger.setLevel(logging.DEBUG)
 
-        self.logger.setLevel(logging.INFO)
+        self.mac_to_port: dict = {}
+        self.datapaths:   dict = {}   
+        self.ip_to_mac:   dict = {}   
 
-        self.mac_to_port = {}
-        self.datapaths = {}
-        self.policy = PolicyEngine()
+        self.role_by_ip: dict = {}
 
-        self.role_by_ip = {
-            "10.0.0.1": "guest",     # h1
-            "10.0.0.2": "admin",     # h2
-            "10.0.0.3": "employee",  # h3
-            "10.0.0.4": "server",    # h4
-        }
+        self.server_ips = frozenset(ROLE_SERVER_MAP.values())
 
-        self.reroute = RerouteEngine()
+        self.redirect = RedirectEngine()
 
-        self.monitor_thread = hub.spawn(self._monitor_loop)
-        self.stats_thread   = hub.spawn(self._stats_loop)
+        self.sessions_file       = os.path.join(_BASE_DIR, 'sessions.json')
+        self._last_sessions_poll = 0.0
 
-        self.logger.info("DynamicAccessController initialized (QoS v2: queue-shaping + rerouting)")
+        self.poll_thread = hub.spawn(self._poll_loop)
 
-    def _monitor_loop(self):
-        while True:
+        self.logger.info(
+            "DynamicAccessController ready — role-based redirect (no QoS)"
+        )
+
+    def _load_portal_sessions(self):
+        """Read sessions.json, update role_by_ip, trigger redirect changes."""
+        try:
+            with open(self.sessions_file, 'r') as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return
+        except (json.JSONDecodeError, OSError) as e:
+            self.logger.warning("[PORTAL] Could not read %s: %s", self.sessions_file, e)
+            return
+
+        sessions = data.get('sessions', {})
+        now = time.time()
+        active_ips: set = set()
+        self.logger.debug("[PORTAL] Read %d session(s) from %s", len(sessions), self.sessions_file)
+
+        for ip, entry in sessions.items():
+            if ip in self.server_ips:
+                continue
+            if not isinstance(entry, dict):
+                self.logger.warning("[PORTAL] %s: bad entry format (not a dict) — old sessions.json?", ip)
+                continue
             try:
-                for ip, host in list(self.policy.hosts.items()):
-                    elapsed = time.time() - host.window_start_ts
-                    if elapsed >= WINDOW_SECONDS:
-                        new_queue = self.policy.decide_queue(host)
-                        old_queue = host.current_queue
+                expires_at = float(entry.get('expires_at', 0))
+                if now >= expires_at:
+                    self.logger.debug(
+                        "[PORTAL] %s: skipping expired entry (expired %.0fs ago)",
+                        ip, now - expires_at,
+                    )
+                    continue
+            except (TypeError, ValueError):
+                continue
 
-                        host.current_queue = new_queue
+            role = entry.get('role', DEFAULT_ROLE)
+            active_ips.add(ip)
 
-                        self.logger.info(
-                            "[WINDOW] ip=%s mac=%s role=%s packet:%s var=%.3f stable=%s q%s->q%s",
-                            ip,
-                            host.mac,
-                            host.role,
-                            host.last_packet_count,
-                            host.variation_score,
-                            host.stable_cycles,
-                            old_queue,
-                            new_queue,
-                        )
+            old_role         = self.role_by_ip.get(ip)
+            expected_target  = ROLE_SERVER_MAP.get(role, GUEST_SERVER_IP)
+            installed_target = self.redirect.get_installed_target(ip)
 
-                        self.policy.commit_window(ip)
-                        self._apply_host_policy(ip, host.current_queue)
-            except Exception as e:
-                self.logger.exception("monitor loop error: %s", e)
+            self.role_by_ip[ip] = role
 
-            hub.sleep(1)
-
-    def _stats_loop(self):
-        """Periodically request port statistics from all connected switches."""
-        while True:
-            hub.sleep(STATS_INTERVAL)
-            for dp in list(self.datapaths.values()):
-                self._send_port_stats_request(dp)
-
-    def _send_port_stats_request(self, datapath):
-        parser  = datapath.ofproto_parser
-        ofproto = datapath.ofproto
-        req = parser.OFPPortStatsRequest(datapath, 0, ofproto.OFPP_ANY)
-        datapath.send_msg(req)
-
-    @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
-    def port_stats_reply_handler(self, ev):
-        """Ingest port stats into RerouteEngine, then ask it for a decision."""
-        dpid = ev.msg.datapath.id
-
-        for stat in ev.msg.body:
-            bps = self.reroute.update_port_stats(dpid, stat.port_no, stat.tx_bytes)
-            if bps > 0:
+            # Install/update if role changed or previous install failed (MACs missing)
+            if old_role != role or installed_target != expected_target:
                 self.logger.info(
-                    "[STATS] dpid=%s port=%s tx=%.2f Kbps",
-                    dpid, stat.port_no, bps / 1e3,
+                    "[PORTAL] %s: %s → %s (user=%s)",
+                    ip, old_role or '(none)', role, entry.get('username', '?'),
                 )
+                self._update_redirect(ip, role)
 
-        result = self.reroute.check_congestion(dpid)
-        bps = self.reroute.get_bps(*CONGESTION_MONITOR)
+        # Evict expired/removed sessions and restore to guest path
+        for ip in list(self.role_by_ip.keys()):
+            if ip not in active_ips:
+                old_role = self.role_by_ip.pop(ip, DEFAULT_ROLE)
+                self.logger.info(
+                    "[PORTAL] %s: session expired (was %s) —> guest", ip, old_role
+                )
+                self._update_redirect(ip, DEFAULT_ROLE)
 
-        if result == CONGESTION_DETECTED:
-            self.logger.warning(
-                "[CONGESTION] Detected dpid=%s port=%s: %.2f Kbps — rerouting roles=%s",
-                CONGESTION_MONITOR[0], CONGESTION_MONITOR[1], bps / 1e3, ROLES_TO_REROUTE,
-            )
-            self._toggle_reroute(activate=True)
+    def _poll_loop(self):
+        while True:
+            hub.sleep(SESSION_POLL_INTERVAL)
+            try:
+                self._load_portal_sessions()
+                self._retry_pending()
+            except Exception as e:
+                self.logger.exception("poll loop error: %s", e)
 
-        elif result == CONGESTION_ACTIVE:
+    def _update_redirect(self, client_ip: str, role: str):
+        """Install, update, or remove redirect flows on s0 for a client IP."""
+        s0 = self.datapaths.get(TOPO_HUB_SWITCH)
+        if not s0:
+            return 
+
+        target_server_ip = ROLE_SERVER_MAP.get(role, GUEST_SERVER_IP)
+        installed_target = self.redirect.get_installed_target(client_ip)
+
+        if target_server_ip != GUEST_SERVER_IP or installed_target:
+            ofproto = s0.ofproto
+            parser  = s0.ofproto_parser
+            s0.send_msg(parser.OFPFlowMod(
+                datapath=s0,
+                command=ofproto.OFPFC_DELETE,
+                out_port=ofproto.OFPP_ANY,
+                out_group=ofproto.OFPG_ANY,
+                match=parser.OFPMatch(eth_type=0x0800, ipv4_src=client_ip),
+            ))
+
+        if installed_target and installed_target != target_server_ip:
+            self._remove_return_flow(s0, installed_target, client_ip)
+            self.redirect.clear_installed(client_ip)
+
+        if target_server_ip == GUEST_SERVER_IP:
+            self.redirect.clear_installed(client_ip)
             self.logger.info(
-                "[CONGESTION] Active dpid=%s port=%s: %.2f Kbps",
-                CONGESTION_MONITOR[0], CONGESTION_MONITOR[1], bps / 1e3,
-            )
-
-        elif result == CONGESTION_CLEARED:
-            self.logger.info(
-                "[CONGESTION] Cleared dpid=%s port=%s — restoring primary path",
-                CONGESTION_MONITOR[0], CONGESTION_MONITOR[1],
-            )
-            self._toggle_reroute(activate=False)
-
-        elif self.reroute.congestion_active:
-            # below threshold but hysteresis not yet satisfied
-            self.logger.info(
-                "[CONGESTION] Below threshold dpid=%s port=%s: %.2f Kbps (count=%s/%s before clear)",
-                CONGESTION_MONITOR[0], CONGESTION_MONITOR[1], bps / 1e3,
-                self.reroute.below_count(), 6,
-            )
-
-    def _toggle_reroute(self, activate: bool):
-        """Install (True) or remove (False) reroute flows on s1 for all ROLES_TO_REROUTE IPs."""
-        s1 = self.datapaths.get(TOPO_HOST_SWITCH)
-        if not s1:
-            self.logger.warning(
-                "[REROUTE] s1 (dpid=%s) not connected — skipping", TOPO_HOST_SWITCH
+                "[REDIRECT] %s → guest (default path → %s)", client_ip, GUEST_SERVER_IP
             )
             return
 
-        for ip, role in self.role_by_ip.items():
-            if role not in ROLES_TO_REROUTE:
-                continue
 
-            if activate:
-                self._install_reroute_flow(s1, ip)
-                self.reroute.mark_rerouted(ip)
-                self.logger.info(
-                    "[REROUTE] ip=%s role=%s → ALTERNATE path (egress port %s)",
-                    ip, role, ALTERNATE_EGRESS_PORT,
-                )
-            else:
-                self._remove_reroute_flow(s1, ip)
-                self._delete_learned_flows(ip)
-                self.reroute.clear_rerouted(ip)
-                self.logger.info(
-                    "[REROUTE] ip=%s role=%s → PRIMARY path restored (egress port %s)",
-                    ip, role, PRIMARY_EGRESS_PORT,
-                )
+        server_mac  = self.ip_to_mac.get(target_server_ip)
+        guest_mac   = self.ip_to_mac.get(GUEST_SERVER_IP)
+        client_mac  = self.ip_to_mac.get(client_ip)
+        client_port = (
+            self.mac_to_port.get(TOPO_HUB_SWITCH, {}).get(client_mac)
+            if client_mac else None
+        )
+        egress_port = SERVER_EGRESS_PORT.get(target_server_ip)
 
-    def _install_reroute_flow(self, datapath, ip_src: str):
-        """High-priority flow on s1: redirect ip_src traffic out the alternate egress port."""
-        parser   = datapath.ofproto_parser
-        host     = self.policy.get_host(ip_src)
-        queue_id = host.current_queue if host else 2    # fallback: guest queue
+        if not server_mac:
+            self.logger.warning(
+                "[REDIRECT] MAC for %s not yet learned → will retry", target_server_ip
+            )
+            return
+        if not guest_mac:
+            self.logger.warning(
+                "[REDIRECT] MAC for guest server %s not yet learned → will retry",
+                GUEST_SERVER_IP,
+            )
+            return
+        if client_port is None:
+            self.logger.warning(
+                "[REDIRECT] Port for client %s not yet known on s0 → will retry",
+                client_ip,
+            )
+            return
+        if egress_port is None:
+            self.logger.error(
+                "[REDIRECT] No egress port configured for %s", target_server_ip
+            )
+            return
 
-        match   = parser.OFPMatch(eth_type=0x0800, ipv4_src=ip_src)
-        actions = [
-            parser.OFPActionSetQueue(queue_id),
-            parser.OFPActionOutput(ALTERNATE_EGRESS_PORT),
+        self._install_redirect_flows(
+            s0, client_ip, target_server_ip,
+            server_mac, guest_mac, client_port, egress_port,
+        )
+        self.redirect.set_installed(client_ip, target_server_ip)
+        self.logger.info(
+            "[REDIRECT] %s role=%s → %s (fwd_port=%s ret_port=%s)",
+            client_ip, role, target_server_ip, egress_port, client_port,
+        )
+
+    def _install_redirect_flows(self, datapath, client_ip, server_ip,
+                                 server_mac, guest_mac, client_port, egress_port):
+        parser = datapath.ofproto_parser
+
+        # Forward: client - target server  (rewrite destination)
+        fwd_match   = parser.OFPMatch(eth_type=0x0800, ipv4_src=client_ip)
+        fwd_actions = [
+            parser.OFPActionSetField(ipv4_dst=server_ip),
+            parser.OFPActionSetField(eth_dst=server_mac),
+            parser.OFPActionOutput(egress_port),
         ]
-        self.add_flow(datapath, REROUTE_PRIORITY, match, actions)
+        self.add_flow(datapath, REDIRECT_PRIORITY, fwd_match, fwd_actions)
 
-    def _remove_reroute_flow(self, datapath, ip_src: str):
-        """Delete the high-priority reroute flow for ip_src on s1."""
+        # Return: target server - client  (rewrite source back to guest server IP)
+        ret_match   = parser.OFPMatch(
+            eth_type=0x0800, ipv4_src=server_ip, ipv4_dst=client_ip
+        )
+        ret_actions = [
+            parser.OFPActionSetField(ipv4_src=GUEST_SERVER_IP),
+            parser.OFPActionSetField(eth_src=guest_mac),
+            parser.OFPActionOutput(client_port),
+        ]
+        self.add_flow(datapath, REDIRECT_PRIORITY, ret_match, ret_actions)
+
+    def _remove_redirect_flows(self, datapath, client_ip: str, installed_server_ip: str):
+        """Delete both the forward and return redirect flows for a client from s0."""
         ofproto = datapath.ofproto
         parser  = datapath.ofproto_parser
-        match   = parser.OFPMatch(eth_type=0x0800, ipv4_src=ip_src)
-        mod = parser.OFPFlowMod(
-            datapath=datapath,
-            command=ofproto.OFPFC_DELETE_STRICT,
-            out_port=ofproto.OFPP_ANY,
-            out_group=ofproto.OFPG_ANY,
-            priority=REROUTE_PRIORITY,
-            match=match,
-        )
-        datapath.send_msg(mod)
-
-    def _delete_learned_flows(self, ip_src: str):
-        """Remove MAC-learning flows for ip_src from ALL switches so they are
-        re-learned on the correct path after a rerouting change."""
-        for dp in self.datapaths.values():
-            ofproto = dp.ofproto
-            parser  = dp.ofproto_parser
-            match   = parser.OFPMatch(eth_type=0x0800, ipv4_src=ip_src)
-            mod = parser.OFPFlowMod(
-                datapath=dp,
+        for match in [
+            parser.OFPMatch(eth_type=0x0800, ipv4_src=client_ip),
+            parser.OFPMatch(
+                eth_type=0x0800, ipv4_src=installed_server_ip, ipv4_dst=client_ip
+            ),
+        ]:
+            datapath.send_msg(parser.OFPFlowMod(
+                datapath=datapath,
                 command=ofproto.OFPFC_DELETE,
                 out_port=ofproto.OFPP_ANY,
                 out_group=ofproto.OFPG_ANY,
                 match=match,
-            )
-            dp.send_msg(mod)
+            ))
+        self.redirect.clear_installed(client_ip)
 
-    def _get_flood_ports(self, dpid, in_port):
-        """Return an explicit list of ports for broadcast/unknown-unicast flooding,
-        or None to fall back to standard OFPP_FLOOD.
-
-        Diamond topology loop prevention:
-          - s1 (dpid=1): hosts on ports 1-3, primary uplink=port4 (→s2),
-                         alternate uplink=port5 (→s3).
-            * Traffic from a host: flood to other hosts + PRIMARY uplink only.
-              Never flood to BOTH uplinks — that creates a loop via s2→s4→s3→s1.
-            * Traffic from an uplink: flood to host-facing ports only.
-          - s4 (dpid=4): h4 on port3, uplinks port1 (←s2) and port2 (←s3).
-            * From any uplink: only forward to h4 (port3).
-            * From h4: only forward upstream via primary (port1→s2).
-        """
-        if dpid == TOPO_HOST_SWITCH:   # s1
-            host_ports = [p for p in (1, 2, 3) if p != in_port]
-            if in_port in (1, 2, 3):   # packet from a host
-                return host_ports + [PRIMARY_EGRESS_PORT]   # NOT ALTERNATE
-            else:                       # packet from s2 or s3
-                return host_ports       # only to host-facing ports
-
-        if dpid == TOPO_SERVER_SWITCH:  # s4
-            if in_port in (1, 2):       # from s2 or s3
-                return [3]              # only to h4
-            if in_port == 3:            # from h4
-                return [1]              # primary return path only (→s2)
-
-        return None  # s2/s3 have no loop risk — standard flood is fine
-
-    @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
-    def switch_features_handler(self, ev):
-        datapath = ev.msg.datapath
+    def _remove_return_flow(self, datapath, server_ip: str, client_ip: str):
+        """Delete only the return flow (server→client) for a previously active server."""
         ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-
-        self.datapaths[datapath.id] = datapath
-        self.mac_to_port.setdefault(datapath.id, {})
-        # Clear stale MAC-table entries from any previous run
-        self.mac_to_port[datapath.id].clear()
-
-        # Flush ALL existing flows on this switch so poisoned/stale entries
-        # from a previous run cannot interfere.
-        del_mod = parser.OFPFlowMod(
+        parser  = datapath.ofproto_parser
+        datapath.send_msg(parser.OFPFlowMod(
             datapath=datapath,
             command=ofproto.OFPFC_DELETE,
             out_port=ofproto.OFPP_ANY,
             out_group=ofproto.OFPG_ANY,
+            match=parser.OFPMatch(
+                eth_type=0x0800, ipv4_src=server_ip, ipv4_dst=client_ip
+            ),
+        ))
+
+
+    def _retry_pending(self):
+        """Install redirect flows for clients where MACs weren't available yet."""
+        for ip, role in list(self.role_by_ip.items()):
+            if role == DEFAULT_ROLE:
+                continue
+            target = ROLE_SERVER_MAP.get(role, GUEST_SERVER_IP)
+            if self.redirect.get_installed_target(ip) != target:
+                self._update_redirect(ip, role)
+
+    @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
+    def switch_features_handler(self, ev):
+        datapath = ev.msg.datapath
+        ofproto  = datapath.ofproto
+        parser   = datapath.ofproto_parser
+
+        self.datapaths[datapath.id] = datapath
+        self.mac_to_port.setdefault(datapath.id, {})
+
+        datapath.send_msg(parser.OFPFlowMod(
+            datapath=datapath,
+            command=ofproto.OFPFC_DELETE,
+            out_port=ofproto.OFPP_ANY,
+            out_group=ofproto.OFPG_ANY,
+        ))
+
+        self.add_flow(
+            datapath, 0, parser.OFPMatch(),
+            [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)],
         )
-        datapath.send_msg(del_mod)
 
-        # Re-install table-miss → send to controller
-        match = parser.OFPMatch()
-        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
-        self.add_flow(datapath, 0, match, actions)
+        self.logger.info("[SWITCH] Connected dpid=%s (flows flushed)", datapath.id)
 
-        self.logger.info("Switch connected: dpid=%s (flows flushed)", datapath.id)
+        if datapath.id == TOPO_HUB_SWITCH:
+            self._retry_pending()
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
-        msg = ev.msg
+        msg      = ev.msg
         datapath = msg.datapath
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-        dpid = datapath.id
-        in_port = msg.match["in_port"]
+        ofproto  = datapath.ofproto
+        parser   = datapath.ofproto_parser
+        dpid     = datapath.id
+        in_port  = msg.match["in_port"]
 
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocols(ethernet.ethernet)[0]
-        eth_type = eth.ethertype
 
-        if eth_type == 0x88cc:
+        if eth.ethertype == 0x88cc:
             return
 
         src = eth.src
         dst = eth.dst
 
-        ip_src = None
-        ip_dst = None
-
-        ip_pkt = pkt.get_protocol(ipv4.ipv4)
-        if ip_pkt:
-            ip_src = ip_pkt.src
-            ip_dst = ip_pkt.dst
-
-        arp_pkt = pkt.get_protocol(arp.arp)
-        if arp_pkt:
-            ip_src = arp_pkt.src_ip
-            ip_dst = arp_pkt.dst_ip
-
         self.mac_to_port.setdefault(dpid, {})
         self.mac_to_port[dpid][src] = in_port
 
-        if ip_src and ip_src in self.role_by_ip:
-            role = self.role_by_ip[ip_src]
-            self.policy.register_host(ip_src, src, role)
-            self.policy.increment_packet(ip_src, 1)
+        ip_src  = None
+        ip_pkt  = pkt.get_protocol(ipv4.ipv4)
+        arp_pkt = pkt.get_protocol(arp.arp)
 
-            host = self.policy.get_host(ip_src)
+        if ip_pkt:
+            ip_src = ip_pkt.src
+            if ip_src not in ('0.0.0.0',):
+                self.ip_to_mac[ip_src] = src
+        if arp_pkt:
+            ip_src = arp_pkt.src_ip
+            if ip_src not in ('0.0.0.0',):
+                self.ip_to_mac[ip_src] = src
+
+        if ip_src:
+            role = self.role_by_ip.get(ip_src, DEFAULT_ROLE)
             self.logger.info(
-    		"[PKT] ip=%s mac=%s role=%s packet:%s Q_ID=%s",
-    		ip_src,
-    		src,
-   		role,
-    		host.packet_count if host else 0,
-   		host.current_queue if host else "n/a",
-		)
+                "[PKT] dpid=%s port=%s ip=%s mac=%s role=%s",
+                dpid, in_port, ip_src, src, role,
+            )
+            # A non-guest client appeared; try installing flows if they're pending
+            if role != DEFAULT_ROLE and dpid == TOPO_HUB_SWITCH:
+                target = ROLE_SERVER_MAP.get(role, GUEST_SERVER_IP)
+                if self.redirect.get_installed_target(ip_src) != target:
+                    self._update_redirect(ip_src, role)
 
-        out_port = ofproto.OFPP_FLOOD
         if dst in self.mac_to_port[dpid]:
             out_port = self.mac_to_port[dpid][dst]
-
-        actions = []
-
-        if out_port == ofproto.OFPP_FLOOD:
-            # ── Controlled flood: prevent broadcast loops in diamond topology ──
-            flood_ports = self._get_flood_ports(dpid, in_port)
-            if flood_ports is not None:
-                actions = [parser.OFPActionOutput(p) for p in flood_ports]
-            else:
-                actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
         else:
-            # ── Unicast: set QoS queue for source host, then forward ──────────
-            if ip_src and ip_src in self.policy.hosts:
-                host = self.policy.get_host(ip_src)
-                if host:
-                    actions.append(parser.OFPActionSetQueue(host.current_queue))
-            actions.append(parser.OFPActionOutput(out_port))
+            out_port = ofproto.OFPP_FLOOD
 
-            match_fields = {"in_port": in_port, "eth_src": src, "eth_dst": dst}
-            if ip_pkt and ip_src:
-                match_fields["eth_type"] = 0x0800
-                match_fields["ipv4_src"] = ip_src
-                if ip_dst:
-                    match_fields["ipv4_dst"] = ip_dst
+        actions = [parser.OFPActionOutput(out_port)]
 
-            match = parser.OFPMatch(**match_fields)
+        if out_port != ofproto.OFPP_FLOOD:
+            # Low-priority unicast flow; redirect flows (priority=10) override it
+            match = parser.OFPMatch(in_port=in_port, eth_dst=dst)
             self.add_flow(datapath, 1, match, actions)
 
-        data = None
-        if msg.buffer_id == ofproto.OFP_NO_BUFFER:
-            data = msg.data
-
-        out = parser.OFPPacketOut(
+        data = msg.data if msg.buffer_id == ofproto.OFP_NO_BUFFER else None
+        datapath.send_msg(parser.OFPPacketOut(
             datapath=datapath,
             buffer_id=msg.buffer_id,
             in_port=in_port,
             actions=actions,
             data=data,
-        )
-        datapath.send_msg(out)
+        ))
 
     def add_flow(self, datapath, priority, match, actions, buffer_id=None):
         ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
-
+        parser  = datapath.ofproto_parser
+        inst    = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
+        kwargs  = dict(datapath=datapath, priority=priority,
+                       match=match, instructions=inst)
         if buffer_id is not None:
-            mod = parser.OFPFlowMod(
-                datapath=datapath,
-                buffer_id=buffer_id,
-                priority=priority,
-                match=match,
-                instructions=inst,
-            )
-        else:
-            mod = parser.OFPFlowMod(
-                datapath=datapath,
-                priority=priority,
-                match=match,
-                instructions=inst,
-            )
-        datapath.send_msg(mod)
-
-    def _apply_host_policy(self, ip, queue_id):
-        host = self.policy.get_host(ip)
-        if not host:
-            return
-        self.logger.info(
-            "[POLICY] ip=%s mac=%s role=%s queue=q%s rerouted=%s",
-            host.ip,
-            host.mac,
-            host.role,
-            queue_id,
-            self.reroute.is_rerouted(ip),
-        )
-        # Re-install flows on all switches so installed queue matches controller state.
-        # Iterate over all datapaths and update any flow whose ipv4_src matches this IP.
-        for dp in self.datapaths.values():
-            parser  = dp.ofproto_parser
-            ofproto = dp.ofproto
-            match = parser.OFPMatch(eth_type=0x0800, ipv4_src=ip)
-            mod = parser.OFPFlowMod(
-                datapath=dp,
-                command=ofproto.OFPFC_DELETE,
-                out_port=ofproto.OFPP_ANY,
-                out_group=ofproto.OFPG_ANY,
-                priority=1,
-                match=match,
-            )
-            dp.send_msg(mod)
-        if self.reroute.is_rerouted(ip):
-            s1 = self.datapaths.get(TOPO_HOST_SWITCH)
-            if s1:
-                self._install_reroute_flow(s1, ip)
+            kwargs['buffer_id'] = buffer_id
+        datapath.send_msg(parser.OFPFlowMod(**kwargs))
