@@ -1,4 +1,4 @@
-﻿# dynamic_access_controller_qos2.py
+﻿# dynamic_access_controller_redirecting.py
 
 from ryu.base import app_manager
 from ryu.controller import ofp_event
@@ -302,7 +302,12 @@ class DynamicAccessController(app_manager.RyuApp):
         dst = eth.dst
 
         self.mac_to_port.setdefault(dpid, {})
-        self.mac_to_port[dpid][src] = in_port
+        # Never overwrite a MAC once learned on any switch.
+        # web-1/2/3's standalone br-int reflects flooded ARPs back through the
+        # VXLAN chain, causing every switch to see the source MAC arrive on the
+        # wrong (downstream) port.  The first sighting is always correct.
+        if src not in self.mac_to_port[dpid]:
+            self.mac_to_port[dpid][src] = in_port
 
         ip_src  = None
         ip_pkt  = pkt.get_protocol(ipv4.ipv4)

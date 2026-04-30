@@ -1,7 +1,7 @@
 # reroute_engine.py
 TOPO_HUB_SWITCH    = 10   # DPID of the central hub switch (s0 / br0)
 
-# GCP port assignments on s0-edgeswitch (verify with: ovs-ofctl -O OpenFlow13 show br0)
+# GCP port assignments on s0-edgeswitch
 # Mininet: CLIENT=1, web1=2, web2=3, web3=4
 # GCP:     CLIENT=5, web1=6, web2=7, web3=8
 CLIENT_FACING_PORT = 5

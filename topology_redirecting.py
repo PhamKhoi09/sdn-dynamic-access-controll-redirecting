@@ -1,4 +1,4 @@
-# topology_qos2.py
+# topology_redirecting.py
 # Star topology for role-based traffic steering
 #
 #   h1 (client, 10.0.0.100) ─── s0 (hub, DPID=10)
